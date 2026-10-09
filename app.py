@@ -5,7 +5,23 @@ st.set_page_config(page_title="Automatic Petrol Cars Under ₹10L", page_icon="�
 
 IMG = "https://stimg.cardekho.com/images/cms/carnewsimages/editorimages/"
 
-# ------------------------------------------------------------------ DATA
+
+def show_df(data, **kw):
+    """st.dataframe stretched to the container, on both old and new Streamlit versions."""
+    try:
+        st.dataframe(data, width="stretch", **kw)
+    except TypeError:
+        st.dataframe(data, use_container_width=True, **kw)
+
+
+def show_img(url):
+    try:
+        st.image(url, width="stretch")
+    except TypeError:
+        st.image(url, use_container_width=True)
+
+
+# ------------------------------------------------------------------ CAR DATA
 # price         = ex-showroom (Delhi, ₹ lakh) of the cheapest automatic variant (CarDekho, Aug 2026)
 # sunroof_price = ex-showroom of the cheapest AUTOMATIC variant that has a sunroof (Autocar India, Mar 2026)
 # base_known    = False -> `price` is already the sunroof variant's price (base automatic price not checked)
@@ -51,7 +67,7 @@ CARS = [
          engine="1.2L turbo-petrol", turbo=True, power=110, torque=200, gearbox="Automatic (TC)", speeds="6-speed",
          mileage=18.89, img=IMG + "6a745df8d8f8f.jpg",
          sunroof=True, sunroof_price=9.99, sunroof_variant="MX2 Pro AT"),
-    # --- Added: automatics under ₹10 L whose cheapest automatic with a sunroof was listed by Autocar India.
+    # --- Automatics under ₹10 L whose cheapest automatic with a sunroof was listed by Autocar India.
     # Base automatic price not checked, so `price` = sunroof variant. No image / mileage available.
     dict(name="Tata Punch", variant="Pure+ S AMT", price=7.89, body="Compact SUV", seats=5,
          engine="1.2L petrol", turbo=False, power=88, torque=None, gearbox="AMT", speeds="5-speed",
@@ -75,6 +91,39 @@ CARS = [
          sunroof=True, sunroof_price=9.89, sunroof_variant="HTK(O) DCT", base_known=False),
 ]
 
+# ------------------------------------------------------------------ ON-ROAD PRICE MODEL
+# on-road = ex-showroom + RTO/road tax + first-year insurance + small fixed charges (registration, FASTag, HSRP)
+#
+# Calibrated against CarDekho's Oct 2026 Maruti Swift quotes (LXi and top variant) for each city.
+# Hyderabad is exact for the whole Swift range (RTO = 14% of ex-showroom + ₹3,200).
+# Other cities are fitted to the same quotes, so treat them as estimates (±₹10-15k).
+# Dealer extras (accessories, extended warranty, handling) and discounts are NOT included.
+#
+# slabs: list of (ex-showroom upper limit in ₹ lakh, effective RTO rate)
+CITY_CFG = {
+    "Hyderabad": dict(slabs=[(1e9, 0.14)], rto_fixed=3200, other=0),
+    "Delhi": dict(slabs=[(6.0, 0.04), (10.0, 0.07), (1e9, 0.10)], rto_fixed=0, other=4400),
+    "Mumbai": dict(slabs=[(1e9, 0.11)], rto_fixed=0, other=3000),
+    "Pune": dict(slabs=[(1e9, 0.11)], rto_fixed=0, other=3000),
+    "Bangalore": dict(slabs=[(5.0, 0.1443), (1e9, 0.1554)], rto_fixed=0, other=2000),
+    "Chennai": dict(slabs=[(1e9, 0.13)], rto_fixed=0, other=2600),
+    "Ahmedabad": dict(slabs=[(1e9, 0.058)], rto_fixed=0, other=15700),
+    "Jaipur": dict(slabs=[(1e9, 0.101)], rto_fixed=0, other=1800),
+    "Lucknow": dict(slabs=[(1e9, 0.088)], rto_fixed=0, other=500),
+}
+INS_BASE_RS, INS_RATE = 12756, 0.0368  # insurance ≈ ₹12,756 + 3.68% of ex-showroom
+
+
+def onroad(ex_lakh, cfg):
+    """Return dict of rto, ins, other (₹) and total on-road (₹ lakh) for an ex-showroom price in ₹ lakh."""
+    ex = ex_lakh * 1e5
+    rate = next(r for upto, r in cfg["slabs"] if ex_lakh <= upto)
+    rto = ex * rate + cfg["rto_fixed"]
+    ins = INS_BASE_RS + INS_RATE * ex
+    other = cfg["other"]
+    return dict(rto=rto, ins=ins, other=other, total=(ex + rto + ins + other) / 1e5)
+
+
 df = pd.DataFrame(CARS)
 df["base_known"] = df["base_known"].fillna(True).astype(bool)
 df["sunroof_extra"] = (df.sunroof_price - df.price).where(df.base_known)  # extra cost of sunroof over cheapest auto
@@ -82,17 +131,25 @@ df["sunroof_extra"] = (df.sunroof_price - df.price).where(df.base_known)  # extr
 # ------------------------------------------------------------------ SIDEBAR FILTERS
 st.sidebar.header("🔎 Filters")
 
+city = st.sidebar.selectbox("📍 City (for on-road price)", list(CITY_CFG) + ["Custom"], index=0)
+if city == "Custom":
+    c_rate = st.sidebar.slider("RTO / road tax (% of ex-showroom)", 0.0, 25.0, 12.0, 0.5)
+    c_other = st.sidebar.number_input("Other fixed charges (₹)", 0, 50000, 5000, 500)
+    cfg = dict(slabs=[(1e9, c_rate / 100)], rto_fixed=0, other=int(c_other))
+else:
+    cfg = CITY_CFG[city]
+
+budget_basis = st.sidebar.radio("Budget applies to", ["On-road price", "Ex-showroom price"])
+
 search = st.sidebar.text_input("Search by name", placeholder="e.g. Swift")
 
 sunroof_choice = st.sidebar.radio(
     "☀️ Sunroof", ["Any", "With sunroof", "Without sunroof"],
     help="'With sunroof' shows the price of the cheapest AUTOMATIC variant that has one, "
          "and applies the budget slider to that price.")
-
 with_sr = sunroof_choice == "With sunroof"
-df["shown_price"] = df.sunroof_price.where(with_sr & df.sunroof, df.price)
 
-budget = st.sidebar.slider("Ex-showroom price (₹ lakh)", 4.5, 10.0, (4.5, 10.0), step=0.25)
+budget = st.sidebar.slider(f"Budget (₹ lakh, {budget_basis.lower()})", 4.5, 12.0, (4.5, 10.0), step=0.25)
 
 body_types = st.sidebar.multiselect("Body type", sorted(df.body.unique()), default=sorted(df.body.unique()))
 gearboxes = st.sidebar.multiselect("Transmission", sorted(df.gearbox.unique()), default=sorted(df.gearbox.unique()))
@@ -107,6 +164,13 @@ sort_by = st.sidebar.selectbox("Sort by", [
     "Price (low → high)", "Price (high → low)", "Mileage (high → low)",
     "Power (high → low)", "Sunroof extra cost (low → high)"])
 
+# ------------------------------------------------------------------ PRICES FOR SELECTED CITY
+df["ex_shown"] = df.sunroof_price.where(with_sr & df.sunroof, df.price)
+parts = pd.DataFrame(df.ex_shown.map(lambda x: onroad(x, cfg)).tolist(), index=df.index)
+df["rto"], df["ins"], df["other"], df["onroad"] = parts.rto, parts.ins, parts.other, parts.total
+df["sunroof_onroad"] = df.sunroof_price.map(lambda x: onroad(x, cfg)["total"] if pd.notna(x) else float("nan"))
+df["budget_price"] = df.onroad if budget_basis == "On-road price" else df.ex_shown
+
 # ------------------------------------------------------------------ APPLY FILTERS
 f = df.copy()
 if search:
@@ -115,7 +179,7 @@ if sunroof_choice == "With sunroof":
     f = f[f.sunroof]
 elif sunroof_choice == "Without sunroof":
     f = f[~f.sunroof]
-f = f[f.shown_price.between(*budget)]
+f = f[f.budget_price.between(*budget)]
 f = f[f.body.isin(body_types) & f.gearbox.isin(gearboxes)]
 if seats != "Any":
     f = f[f.seats == int(seats)]
@@ -129,8 +193,8 @@ if min_power:
     f = f[f.power.fillna(-1) >= min_power]
 
 sorters = {
-    "Price (low → high)": ("shown_price", True),
-    "Price (high → low)": ("shown_price", False),
+    "Price (low → high)": ("onroad", True),
+    "Price (high → low)": ("onroad", False),
     "Mileage (high → low)": ("mileage", False),
     "Power (high → low)": ("power", False),
     "Sunroof extra cost (low → high)": ("sunroof_extra", True),
@@ -140,19 +204,19 @@ f = f.sort_values(col, ascending=asc, na_position="last").reset_index(drop=True)
 
 # ------------------------------------------------------------------ HEADER
 st.title("🚗 Petrol Automatic Cars Under ₹10 Lakh")
-st.caption("Ex-showroom Delhi prices. On-road price in your city will be ~10–15% higher. "
-           "Sources: CarDekho (Aug 2026) for base prices, Autocar India (Mar 2026) for sunroof variant prices.")
+st.caption(f"On-road prices are estimates for **{city}**. Ex-showroom prices are Delhi figures from CarDekho (Aug 2026); "
+           "sunroof variant prices are from Autocar India (Mar 2026).")
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Cars matching", len(f))
 if len(f):
-    m2.metric("Cheapest" + (" (sunroof)" if with_sr else ""), f"₹{f.shown_price.min():.2f} L")
+    m2.metric(f"Cheapest on-road ({city})", f"₹{f.onroad.min():.2f} L")
     best = f.mileage.max()
     m3.metric("Best mileage", f"{best:.1f} kmpl" if pd.notna(best) else "—")
     m4.metric("With sunroof", int(f.sunroof.sum()))
 
 if f.empty:
-    st.warning("No cars match these filters. Try loosening them.")
+    st.warning("No cars match these filters. Try loosening them, or switch the budget to ex-showroom price.")
     st.stop()
 
 
@@ -161,15 +225,15 @@ def fmt(v, suffix=""):
 
 
 def sunroof_line(r):
-    if not r.sunroof:
-        return "🚫 **Sunroof:** not offered (in automatic variants under ₹10 L)"
     extra = ""
     if pd.notna(r.sunroof_extra):
-        extra = f" (+₹{r.sunroof_extra:.2f} L)" if r.sunroof_extra > 0 else " (no extra cost)"
-    return f"☀️ **Sunroof:** {r.sunroof_variant} at ₹{r.sunroof_price:.2f} L{extra}"
+        extra = f", +₹{r.sunroof_extra:.2f} L over base" if r.sunroof_extra > 0 else ", no extra cost"
+    return (f"{r.sunroof_variant}: ₹{r.sunroof_price:.2f} L ex-showroom "
+            f"(₹{r.sunroof_onroad:.2f} L on-road{extra})")
 
 
-tab_cards, tab_table, tab_compare, tab_chart = st.tabs(["🖼️ Cards", "📋 Table", "⚖️ Compare", "📊 Chart"])
+tab_cards, tab_table, tab_compare, tab_city, tab_chart = st.tabs(
+    ["🖼️ Cards", "📋 Table", "⚖️ Compare", "🏙️ City-wise on-road", "📊 Chart"])
 
 # ------------------------------------------------------------------ CARDS
 with tab_cards:
@@ -178,7 +242,7 @@ with tab_cards:
         with cols[i % 3].container(border=True):
             if isinstance(r.img, str):
                 try:
-                    st.image(r.img, use_container_width=True)
+                    show_img(r.img)
                 except Exception:
                     st.write("🖼️ Image unavailable")
             else:
@@ -186,9 +250,11 @@ with tab_cards:
             st.subheader(r["name"])
             variant = r.sunroof_variant if (with_sr and r.sunroof) else r.variant
             st.caption(f"{variant} · {r.body} · {r.seats} seats")
-            st.markdown(f"### ₹{r.shown_price:.2f} L")
+            st.markdown(f"### ₹{r.onroad:.2f} L on-road")
+            st.caption(f"{city} · Ex-showroom ₹{r.ex_shown:.2f} L")
+            st.caption(f"RTO ₹{r.rto:,.0f} · Insurance ₹{r.ins:,.0f} · Other ₹{r.other:,.0f}")
             if r.sunroof:
-                st.success(sunroof_line(r).replace("**", ""), icon="☀️")
+                st.success(sunroof_line(r), icon="☀️")
             else:
                 st.info("No sunroof in automatic variants under ₹10 L", icon="🚫")
             st.markdown(
@@ -207,10 +273,15 @@ with tab_table:
         "Variant": f.variant,
         "Body": f.body,
         "Seats": f.seats,
-        "Cheapest auto (₹ L)": f.price,
+        "Ex-showroom (₹ L)": f.ex_shown,
+        "RTO (₹)": f.rto.round(0),
+        "Insurance (₹)": f.ins.round(0),
+        "Other (₹)": f.other,
+        f"On-road {city} (₹ L)": f.onroad.round(2),
         "Sunroof": f.sunroof.map({True: "Yes", False: "No"}),
         "Sunroof variant": f.sunroof_variant.fillna("—"),
-        "Sunroof auto price (₹ L)": f.sunroof_price,
+        "Sunroof ex-showroom (₹ L)": f.sunroof_price,
+        "Sunroof on-road (₹ L)": f.sunroof_onroad.round(2),
         "Sunroof extra (₹ L)": f.sunroof_extra.round(2),
         "Engine": f.engine,
         "Power (PS/hp)": f.power,
@@ -218,7 +289,7 @@ with tab_table:
         "Gearbox": f.speeds + " " + f.gearbox,
         "Mileage (kmpl)": f.mileage,
     })
-    st.dataframe(table, use_container_width=True, hide_index=True)
+    show_df(table, hide_index=True)
     st.download_button("⬇️ Download CSV", table.to_csv(index=False), "cars_under_10_lakh.csv", "text/csv")
 
 # ------------------------------------------------------------------ COMPARE
@@ -228,10 +299,11 @@ with tab_compare:
         sel = f[f.name.isin(picks)].set_index("name")
         cmp = pd.DataFrame({
             "Variant": sel.variant,
-            "Cheapest auto (₹ L)": sel.price.map("{:.2f}".format),
+            "Ex-showroom (₹ L)": sel.ex_shown.map("{:.2f}".format),
+            f"On-road {city} (₹ L)": sel.onroad.map("{:.2f}".format),
             "Sunroof": sel.sunroof.map({True: "Yes", False: "No"}),
             "Sunroof variant": sel.sunroof_variant.fillna("—"),
-            "Sunroof auto price (₹ L)": sel.sunroof_price.map(lambda v: "—" if pd.isna(v) else f"{v:.2f}"),
+            "Sunroof on-road (₹ L)": sel.sunroof_onroad.map(lambda v: "—" if pd.isna(v) else f"{v:.2f}"),
             "Body": sel.body,
             "Seats": sel.seats,
             "Engine": sel.engine,
@@ -240,16 +312,32 @@ with tab_compare:
             "Gearbox": sel.speeds + " " + sel.gearbox,
             "Mileage (kmpl)": sel.mileage.map(fmt),
         }).T
-        st.dataframe(cmp, use_container_width=True)
+        show_df(cmp)
     else:
         st.info("Select at least two cars.")
+
+# ------------------------------------------------------------------ CITY-WISE
+with tab_city:
+    pick = st.selectbox("Car", f.name.tolist(), key="city_car")
+    row = f[f.name == pick].iloc[0]
+    st.caption(f"{pick} · {row.sunroof_variant if (with_sr and row.sunroof) else row.variant} · "
+               f"ex-showroom ₹{row.ex_shown:.2f} L")
+    rows = []
+    for cname, ccfg in CITY_CFG.items():
+        p = onroad(row.ex_shown, ccfg)
+        rows.append({"City": cname, "RTO (₹)": round(p["rto"]), "Insurance (₹)": round(p["ins"]),
+                     "Other (₹)": p["other"], "On-road (₹ L)": round(p["total"], 2),
+                     "Over ex-showroom (%)": round((p["total"] / row.ex_shown - 1) * 100, 1)})
+    cdf = pd.DataFrame(rows).sort_values("On-road (₹ L)").reset_index(drop=True)
+    show_df(cdf, hide_index=True)
+    st.bar_chart(cdf.set_index("City")["On-road (₹ L)"])
 
 # ------------------------------------------------------------------ CHART
 with tab_chart:
     metrics = {
-        "Price shown (₹ L)": "shown_price",
-        "Cheapest automatic price (₹ L)": "price",
-        "Sunroof automatic price (₹ L)": "sunroof_price",
+        f"On-road price, {city} (₹ L)": "onroad",
+        "Ex-showroom price (₹ L)": "ex_shown",
+        "Sunroof automatic ex-showroom (₹ L)": "sunroof_price",
         "Sunroof extra cost (₹ L)": "sunroof_extra",
         "Mileage (kmpl)": "mileage",
         "Power": "power",
@@ -262,4 +350,8 @@ with tab_chart:
     else:
         st.bar_chart(chart_df)
 
-st.caption("Specs and prices vary by variant, city and time. Confirm final price, features and sunroof availability with your dealer.")
+st.caption(
+    "On-road = ex-showroom + RTO/road tax + first-year insurance + small fixed charges. Calibrated to CarDekho's "
+    "Oct 2026 Maruti Swift quotes: exact for Hyderabad, fitted (about ±₹10–15k) for other cities. Excludes "
+    "accessories, extended warranty, dealer handling and discounts. Confirm the final quote with your dealer."
+)
